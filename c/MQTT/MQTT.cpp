@@ -48,6 +48,7 @@ struct CsvColumns {
     int sniffer_methane = 0;
     int latitude = 0;
     int longitude = 0;
+    int altitude = 0;
     int wind_x = 0;
     int wind_y = 0;
     int wind_z = 0;
@@ -70,13 +71,14 @@ static int find_column_index(const vector<string>& headers, const vector<string>
 static CsvColumns resolve_columns(const vector<string>& headers)
 {
     CsvColumns c;
-    c.methane = find_column_index(headers, {"Methane"});
-    c.sniffer_methane = find_column_index(headers, {"Sniffer Methane"});
-    c.latitude = find_column_index(headers, {"RTK Lat", "Gimbal Lat", "Targ Lat", "Center Lat"});
-    c.longitude = find_column_index(headers, {"RTK Lon", "Gimbal Lon", "Targ Lon", "Center Lon"});
-    c.wind_x = find_column_index(headers, {"Wind X"});
-    c.wind_y = find_column_index(headers, {"Wind Y"});
-    c.wind_z = find_column_index(headers, {"Wind Z"});
+    c.methane = find_column_index(headers, {"Methane [ppm*m]"});
+    c.sniffer_methane = find_column_index(headers, {"Sniffer Methane [ppm]"});
+    c.latitude = find_column_index(headers, {"RTK Lat [deg]", "Gimbal Lat [deg]", "Targ Lat [deg]", "Center Lat [deg]"});
+    c.longitude = find_column_index(headers, {"RTK Lon [deg]", "Gimbal Lon [deg]", "Targ Lon [deg]", "Center Lon [deg]"});
+    c.altitude = find_column_index(headers, {"RTK HFSL [m]", "Gimbal HFSL [m]", "Targ HFSL [m]", "Center HFSL [m]"});
+    c.wind_x = find_column_index(headers, {"Wind U [m/s]"});
+    c.wind_y = find_column_index(headers, {"Wind V [m/s]"});
+    c.wind_z = find_column_index(headers, {"Wind W [m/s]"});
     return c;
 }
 
@@ -110,6 +112,7 @@ static string build_payload_json(const vector<string>& row, const CsvColumns& co
     const string sniffer = json_number_or_null(get_value(row, cols.sniffer_methane));
     const string latitude = json_number_or_null(get_value(row, cols.latitude));
     const string longitude = json_number_or_null(get_value(row, cols.longitude));
+    const string altitude = json_number_or_null(get_value(row, cols.altitude));
     const string wind_x = json_number_or_null(get_value(row, cols.wind_x));
     const string wind_y = json_number_or_null(get_value(row, cols.wind_y));
     const string wind_z = json_number_or_null(get_value(row, cols.wind_z));
@@ -120,7 +123,8 @@ static string build_payload_json(const vector<string>& row, const CsvColumns& co
     payload << "\"sniffer_methane\":" << sniffer << ",";
     payload << "\"position\":{";
     payload << "\"latitude\":" << latitude << ",";
-    payload << "\"longitude\":" << longitude;
+    payload << "\"longitude\":" << longitude << ",";
+    payload << "\"altitude\":" << altitude;
     payload << "},";
     payload << "\"wind_direction\":{";
     payload << "\"x\":" << wind_x << ",";
