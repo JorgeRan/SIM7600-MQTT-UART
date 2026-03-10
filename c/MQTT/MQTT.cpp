@@ -523,7 +523,7 @@ static void follow_csv_updates_and_publish(
 
 int main(void)
 {
-    const string csv_path = "/home/gimbal/data/eerl/latest.log";
+    const string csv_path = "/data/eerl/latest.log";
     const size_t lines_to_tail = 1;
     const chrono::milliseconds poll_interval(1000);
 
