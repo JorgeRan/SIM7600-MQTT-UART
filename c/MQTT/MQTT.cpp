@@ -108,6 +108,7 @@ static string json_number_or_null(const string& raw)
 
 static string build_payload_json(const vector<string>& row, const CsvColumns& cols)
 {
+    const char *drone_name = "350";
     const string methane = json_number_or_null(get_value(row, cols.methane));
     const string sniffer = json_number_or_null(get_value(row, cols.sniffer_methane));
     const string latitude = json_number_or_null(get_value(row, cols.latitude));
@@ -119,6 +120,7 @@ static string build_payload_json(const vector<string>& row, const CsvColumns& co
 
     ostringstream payload;
     payload << "{";
+    payload << "\"drone\":" << drone_name << ",";
     payload << "\"methane\":" << methane << ",";
     payload << "\"sniffer_methane\":" << sniffer << ",";
     payload << "\"position\":{";
