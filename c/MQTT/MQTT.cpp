@@ -1,11 +1,66 @@
+#include <bits/stdc++.h>
+#include <boost/asio.hpp>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
 #include "../arduPi.h"
 #include "../sim7x00.h"
 #include "MQTT_config.h"
-#include <bits/stdc++.h>
+
+
+
+using boost::asio::ip::udp;
 using namespace std;
 
 static const int POWERKEY = 6;
 static const char APN[]         = "ltemobile.apn";   
+
+
+
+std::string getDroneName() {
+    std::ifstream file("/etc/hostapd/hostapd.conf");
+    if (!file.is_open()) {
+        return "";
+    }
+
+    std::string line;
+    std::string ssid;
+    while (std::getline(file, line)) {
+        if (line.rfind("ssid=", 0) == 0) {
+            ssid = line.substr(5);
+            break;
+        }
+    }
+
+    if (ssid.empty()) {
+        return "";
+    }
+
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (start <= ssid.size()) {
+        size_t end = ssid.find('-', start);
+        if (end == std::string::npos) {
+            parts.push_back(ssid.substr(start));
+            break;
+        }
+        parts.push_back(ssid.substr(start, end - start));
+        start = end + 1;
+    }
+
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (!parts[i].empty() && parts[i][0] == 'M') {
+            if (i + 1 < parts.size() && !parts[i + 1].empty()) {
+                return parts[i] + "-" + parts[i + 1];
+            }
+            return parts[i];
+        }
+    }
+
+    return "";
+}
+
 
 static string trim_copy(const string& value)
 {
@@ -44,11 +99,15 @@ static vector<string> split_csv_line(const string& line)
 }
 
 struct CsvColumns {
+    int timestamp = 0;
     int methane = 0;
     int sniffer_methane = 0;
+    int distance = 0;
     int latitude = 0;
     int longitude = 0;
     int altitude = 0;
+    int targ_latitude = 0;
+    int targ_longitude = 0;
     int wind_x = 0;
     int wind_y = 0;
     int wind_z = 0;
@@ -71,11 +130,15 @@ static int find_column_index(const vector<string>& headers, const vector<string>
 static CsvColumns resolve_columns(const vector<string>& headers)
 {
     CsvColumns c;
+    c.timestamp = find_column_index(headers,{"Timestamp"});
     c.methane = find_column_index(headers, {"Methane [ppm*m]"});
     c.sniffer_methane = find_column_index(headers, {"Sniffer Methane [ppm]"});
+    c.distance = find_column_index(headers,{"Distance [m]"});
     c.latitude = find_column_index(headers, {"RTK Lat [deg]", "Gimbal Lat [deg]", "Targ Lat [deg]", "Center Lat [deg]"});
     c.longitude = find_column_index(headers, {"RTK Lon [deg]", "Gimbal Lon [deg]", "Targ Lon [deg]", "Center Lon [deg]"});
     c.altitude = find_column_index(headers, {"RTK HFSL [m]", "Gimbal HFSL [m]", "Targ HFSL [m]", "Center HFSL [m]"});
+    c.targ_latitude = find_column_index(headers, {"Targ Lat [deg]"});
+    c.targ_longitude = find_column_index(headers, {"Targ Lon [deg]"});
     c.wind_x = find_column_index(headers, {"Wind U [m/s]"});
     c.wind_y = find_column_index(headers, {"Wind V [m/s]"});
     c.wind_z = find_column_index(headers, {"Wind W [m/s]"});
@@ -108,25 +171,35 @@ static string json_number_or_null(const string& raw)
 
 static string build_payload_json(const vector<string>& row, const CsvColumns& cols)
 {
-    const char *drone_name = "350";
+    const string timestamp = get_value(row, cols.timestamp);
+    const string drone_name = getDroneName();
     const string methane = json_number_or_null(get_value(row, cols.methane));
     const string sniffer = json_number_or_null(get_value(row, cols.sniffer_methane));
+    const string distance = json_number_or_null(get_value(row, cols.distance));
     const string latitude = json_number_or_null(get_value(row, cols.latitude));
     const string longitude = json_number_or_null(get_value(row, cols.longitude));
     const string altitude = json_number_or_null(get_value(row, cols.altitude));
+    const string targ_latitude = json_number_or_null(get_value(row, cols.latitude));
+    const string targ_longitude = json_number_or_null(get_value(row, cols.longitude));
     const string wind_x = json_number_or_null(get_value(row, cols.wind_x));
     const string wind_y = json_number_or_null(get_value(row, cols.wind_y));
     const string wind_z = json_number_or_null(get_value(row, cols.wind_z));
 
     ostringstream payload;
     payload << "{";
-    payload << "\"drone\":" << drone_name << ",";
+    payload << "\"timestamp\":\"" << timestamp << "\",";
+    payload << "\"drone\":\"" << drone_name << "\",";
     payload << "\"methane\":" << methane << ",";
     payload << "\"sniffer_methane\":" << sniffer << ",";
+    payload << "\"distance\":\"" << distance << "\",";
     payload << "\"position\":{";
     payload << "\"latitude\":" << latitude << ",";
     payload << "\"longitude\":" << longitude << ",";
     payload << "\"altitude\":" << altitude;
+    payload << "},";
+    payload << "\"target_position\":{";
+    payload << "\"latitude\":" << targ_latitude << ",";
+    payload << "\"longitude\":" << targ_longitude;
     payload << "},";
     payload << "\"wind_direction\":{";
     payload << "\"x\":" << wind_x << ",";
@@ -217,6 +290,54 @@ static string send_binary_collect(const vector<uint8_t>& payload, chrono::millis
     }
 
     return response;
+}
+
+static string read_serial_collect(chrono::milliseconds timeout, chrono::milliseconds idle_timeout = chrono::milliseconds(600))
+{
+    string response;
+    auto deadline = chrono::steady_clock::now() + timeout;
+    auto last_data = chrono::steady_clock::now();
+
+    while (chrono::steady_clock::now() < deadline) {
+        if (Serial.available() > 0) {
+            const char received = Serial.read();
+            response.push_back(received);
+            printf("%c", received);
+            last_data = chrono::steady_clock::now();
+        } else {
+            if (!response.empty() && chrono::steady_clock::now() - last_data >= idle_timeout) {
+                break;
+            }
+            this_thread::sleep_for(chrono::milliseconds(20));
+        }
+    }
+
+    return response;
+}
+
+static int parse_mqtt_connack_code(const string& response)
+{
+    for (size_t i = 0; i + 3 < response.size(); ++i) {
+        const uint8_t b0 = static_cast<uint8_t>(response[i]);
+        const uint8_t b1 = static_cast<uint8_t>(response[i + 1]);
+        if (b0 == 0x20 && b1 == 0x02) {
+            return static_cast<int>(static_cast<uint8_t>(response[i + 3]));
+        }
+    }
+    return -1;
+}
+
+static const char* mqtt_connack_reason(int code)
+{
+    switch (code) {
+    case 0: return "Connection Accepted";
+    case 1: return "Unacceptable Protocol Version";
+    case 2: return "Identifier Rejected";
+    case 3: return "Server Unavailable";
+    case 4: return "Bad Username or Password";
+    case 5: return "Not Authorized";
+    default: return "Unknown";
+    }
 }
 
 static bool sim7600_socket_setup()
@@ -362,21 +483,19 @@ static void sim7600_cellular_init()
     sim7600.sendATcommand("AT+CEREG?", "+CEREG: 0,1",  3000);
     sim7600.sendATcommand("AT+CGATT?", "+CGATT: 1",    3000);
 
-    // Configure and activate the PDP context
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", APN);
     sim7600.sendATcommand(cmd, "OK", 2000);
     sim7600.sendATcommand("AT+CGACT=1,1",  "OK",        5000);
     sim7600.sendATcommand("AT+CGPADDR=1",  "+CGPADDR:", 2000);
 
-    // Verify DNS resolution (informational)
     sim7600.sendATcommand("AT+CDNSGIP=\"google.com\"", "+CDNSGIP:", 8000);
 }
 
+
+
 static bool sim7600_mqtt_connect()
 {
-    const string connack("\x20\x02\x00\x00", 4);
-
     for (int attempt = 1; attempt <= 3; ++attempt) {
         send_at_collect("AT+CIPCLOSE=0", chrono::milliseconds(3000));
         send_at_collect("AT+NETCLOSE", chrono::milliseconds(5000));
@@ -390,27 +509,139 @@ static bool sim7600_mqtt_connect()
         }
 
         string response;
-        if (!sim7600_send_socket_payload(build_connect_packet(), chrono::milliseconds(5000), &response)) {
+        if (!sim7600_send_socket_payload(build_connect_packet(), chrono::milliseconds(8000), &response)) {
             fprintf(stderr, "MQTT CONNECT send failed on attempt %d\n", attempt);
             continue;
         }
 
-        if (response_contains(response, connack)) {
+        int connack_code = parse_mqtt_connack_code(response);
+        if (connack_code < 0) {
+            response += read_serial_collect(chrono::milliseconds(2500));
+            connack_code = parse_mqtt_connack_code(response);
+        }
+
+        if (connack_code == 0) {
             printf("MQTT connected to %s:%d\n", BROKER_HOST, BROKER_PORT);
             return true;
         }
 
-        fprintf(stderr, "MQTT CONNACK failed on attempt %d\n", attempt);
+        if (connack_code >= 0) {
+            fprintf(stderr, "MQTT CONNACK failed on attempt %d (code=%d: %s)\n",
+                    attempt, connack_code, mqtt_connack_reason(connack_code));
+        } else {
+            fprintf(stderr, "MQTT CONNACK not received on attempt %d\n", attempt);
+        }
         delay(1000);
     }
 
     return false;
 }
 
+static bool check_signal_quality() {
+    const string response = send_at_collect("AT+CSQ", chrono::milliseconds(3000));
+    if (!response_contains(response, "+CSQ:")) {
+        fprintf(stderr, "CSQ command failed\n");
+        return false;
+    }
+
+    size_t pos = response.find("+CSQ:");
+    if (pos == string::npos) {
+        return false;
+    }
+
+    pos += 5;
+    while (pos < response.size() && isspace(response[pos])) {
+        pos++;
+    }
+
+    int rssi = -1;
+    try {
+        rssi = stoi(response.substr(pos));
+    } catch (...) {
+        return false;
+    }
+
+    if (rssi == 99) {
+        fprintf(stderr, "Signal not detected or unavailable (RSI = 99)\n");
+        return false;
+    }
+
+    if (rssi < 0 || rssi > 31) {
+        fprintf(stderr, "Invalid signal strength\n");
+        return false;
+    }
+
+    printf("Signal quality: %d\n", rssi);
+    return true;
+}
+
+static bool udp_fallback(std::string telemetry) {
+    boost::asio::io_service io_service;
+    udp::socket socket(io_service);
+    socket.open(udp::v4());
+
+    boost::asio::ip::address destination_ip = boost::asio::ip::address::from_string("10.42.0.255");
+    udp::endpoint remote_endpoint(destination_ip, 5000);
+
+    std::string message = telemetry;
+
+    boost::system::error_code err;
+    socket.send_to(boost::asio::buffer(message), remote_endpoint, 0, err);
+
+    if(err) {
+        std::cerr << "Error sending message: " << err.message() << std::endl;
+        socket.close();
+        return false;
+    } else {
+        std::cout << "Message sent successfully!" << std::endl;
+        socket.close();
+        return true;
+    }
+}
+
 
 static bool publish_payload(const string& payload)
 {
-    return sim7600_send_socket_payload(build_publish_packet(payload), chrono::milliseconds(5000));
+    return sim7600_send_socket_payload(build_publish_packet(payload), chrono::milliseconds(1000));
+}
+
+static string build_batch_payload(const deque<string>& buffered_payloads)
+{
+    ostringstream batch;
+    batch << "{\"batch\":[";
+    for (size_t i = 0; i < buffered_payloads.size(); ++i) {
+        if (i > 0) {
+            batch << ",";
+        }
+        batch << buffered_payloads[i];
+    }
+    batch << "]}";
+    return batch.str();
+}
+
+static void flush_buffered_payloads(deque<string>& buffered_payloads, bool& using_cellular)
+{
+    if (buffered_payloads.empty()) {
+        return;
+    }
+
+    const string batch_payload = build_batch_payload(buffered_payloads);
+    fprintf(stdout, "Sending batch with %zu line(s)...\n", buffered_payloads.size());
+
+    if (using_cellular) {
+        if (!publish_payload(batch_payload)) {
+            fprintf(stderr, "Cellular batch publish failed, checking signal...\n");
+            if (!check_signal_quality()) {
+                fprintf(stdout, "Signal lost! Falling back to UDP...\n");
+                using_cellular = false;
+            }
+            udp_fallback(batch_payload);
+        }
+    } else {
+        udp_fallback(batch_payload);
+    }
+
+    buffered_payloads.clear();
 }
 
 static void sim7600_mqtt_disconnect()
@@ -468,8 +699,36 @@ static void follow_csv_updates_and_publish(
         last_offset = 0;
     }
 
+    bool using_cellular = true;
+    auto last_signal_check = chrono::steady_clock::now();
+    const chrono::milliseconds signal_check_interval(5000);
+
+    auto last_send_time = chrono::steady_clock::now();
+    const chrono::milliseconds send_interval(1000);
+    deque<string> buffered_payloads;
+
     while (true) {
         this_thread::sleep_for(poll_interval);
+
+        auto now = chrono::steady_clock::now();
+        if (now - last_signal_check >= signal_check_interval) {
+            last_signal_check = now;
+
+            bool has_signal = check_signal_quality();
+
+            if (has_signal && !using_cellular) {
+                fprintf(stdout, "Signal recovered! Reconnecting to cellular MQTT...\n");
+                if (sim7600_mqtt_connect()) {
+                    using_cellular = true;
+                    fprintf(stdout, "Successfully reconnected to cellular MQTT\n");
+                } else {
+                    fprintf(stderr, "Failed to reconnect to cellular MQTT, staying on UDP fallback\n");
+                }
+            } else if (!has_signal && using_cellular) {
+                fprintf(stdout, "Signal lost! Falling back to UDP...\n");
+                using_cellular = false;
+            }
+        }
 
         std::error_code ec;
         const uintmax_t current_size = filesystem::file_size(file_path, ec);
@@ -494,6 +753,10 @@ static void follow_csv_updates_and_publish(
         }
 
         if (static_cast<uintmax_t>(last_offset) == current_size) {
+            if (now - last_send_time >= send_interval) {
+                last_send_time = now;
+                flush_buffered_payloads(buffered_payloads, using_cellular);
+            }
             continue;
         }
 
@@ -509,8 +772,8 @@ static void follow_csv_updates_and_publish(
             cout << line << '\n';
             const vector<string> row = split_csv_line(line);
             const string payload = build_payload_json(row, cols);
-            cout << "Publishing JSON: " << payload << '\n';
-            publish_payload(payload);
+            cout << "Buffering JSON: " << payload << '\n';
+            buffered_payloads.push_back(payload);
         }
 
         input.clear();
@@ -519,6 +782,12 @@ static void follow_csv_updates_and_publish(
         if (last_offset < 0) {
             last_offset = 0;
         }
+
+        now = chrono::steady_clock::now();
+        if (now - last_send_time >= send_interval) {
+            last_send_time = now;
+            flush_buffered_payloads(buffered_payloads, using_cellular);
+        }
     }
 }
 
@@ -526,8 +795,8 @@ static void follow_csv_updates_and_publish(
 int main(void)
 {
     const string csv_path = "/data/eerl/latest.log";
-    const size_t lines_to_tail = 1;
-    const chrono::milliseconds poll_interval(1000);
+    const size_t lines_to_tail = 10;
+    const chrono::milliseconds poll_interval(100);
 
     string header_line;
     deque<string> tail_lines;
@@ -539,8 +808,13 @@ int main(void)
 
     sim7600_cellular_init();
 
-    if (!sim7600_mqtt_connect()) {
-        return 2;
+    bool using_cellular = false;
+    if (sim7600_mqtt_connect()) {
+        using_cellular = true;
+        fprintf(stdout, "Connected to cellular MQTT\n");
+    } else {
+        fprintf(stderr, "MQTT connection failed, falling back to UDP\n");
+        using_cellular = false;
     }
 
     cout << "Last " << tail_lines.size() << " line(s) from CSV:\n";
@@ -550,13 +824,27 @@ int main(void)
         const vector<string> row = split_csv_line(row_line);
         const string payload = build_payload_json(row, cols);
         cout << "Publishing JSON: " << payload << '\n';
-        if (!publish_payload(payload)) {
-            rc = 3;
+        
+        if (using_cellular) {
+            if (!publish_payload(payload)) {
+                fprintf(stderr, "Cellular publish failed, checking signal...\n");
+                if (!check_signal_quality()) {
+                    fprintf(stdout, "Signal lost! Falling back to UDP...\n");
+                    using_cellular = false;
+                    udp_fallback(payload);
+                } else {
+                    rc = 3;
+                }
+            }
+        } else {
+            udp_fallback(payload);
         }
     }
 
     follow_csv_updates_and_publish(csv_path, poll_interval, cols);
 
-    sim7600_mqtt_disconnect();
+    if (using_cellular) {
+        sim7600_mqtt_disconnect();
+    }
     return rc;
 }
