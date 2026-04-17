@@ -796,7 +796,7 @@ int main(void)
 {
     const string csv_path = "/data/eerl/latest.log";
     const size_t lines_to_tail = 10;
-    const chrono::milliseconds poll_interval(100);
+    const chrono::milliseconds poll_interval(1000);
 
     string header_line;
     deque<string> tail_lines;
