@@ -6,6 +6,7 @@ using namespace std;
 
 static const int POWERKEY = 6;
 static const char APN[]         = "ltemobile.apn";   
+static const size_t SIM7600_CIPSEND_CHUNK_SIZE = 1500;
 
 static string trim_copy(const string& value)
 {
@@ -75,7 +76,7 @@ static int find_column_index(const vector<string>& headers, const vector<string>
 static CsvColumns resolve_columns(const vector<string>& headers)
 {
     CsvColumns c;
-    c.timestamp = find_column_index(headers, {"Timestamp [yyyy-mm-dd hh:mm:ss.00]"});
+    c.timestamp = find_column_index(headers, {"Timestamp"});
     c.methane = find_column_index(headers, {"Methane [ppm*m]"});
     c.sniffer_methane = find_column_index(headers, {"Sniffer Methane [ppm]"});
     c.distance = find_column_index(headers,{"Distance [m]"});
@@ -117,7 +118,7 @@ static string json_number_or_null(const string& raw)
 static string build_payload_json(const vector<string>& row, const CsvColumns& cols)
 {
     const string timestamp = get_value(row, cols.timestamp);
-    const char *drone_name = "350";
+    const char *drone_name = "M350";
     const string methane = json_number_or_null(get_value(row, cols.methane));
     const string sniffer = json_number_or_null(get_value(row, cols.sniffer_methane));
     const string distance = json_number_or_null(get_value(row, cols.distance));
@@ -156,6 +157,25 @@ static string build_payload_json(const vector<string>& row, const CsvColumns& co
     return payload.str();
 }
 
+static string build_batch_payload_json(const deque<string>& lines, const CsvColumns& cols)
+{
+    ostringstream payload;
+    payload << "[";
+
+    bool first = true;
+    for (const auto& line : lines) {
+        const vector<string> row = split_csv_line(line);
+        if (!first) {
+            payload << ",";
+        }
+        payload << build_payload_json(row, cols);
+        first = false;
+    }
+
+    payload << "]";
+    return payload.str();
+}
+
 static string send_at_collect(const string& command, chrono::milliseconds timeout)
 {
     while (Serial.available() > 0) {
@@ -186,9 +206,61 @@ static string send_at_collect(const string& command, chrono::milliseconds timeou
     return response;
 }
 
+static string send_at_collect_until(
+    const string& command,
+    chrono::milliseconds timeout,
+    const vector<string>& terminal_tokens)
+{
+    while (Serial.available() > 0) {
+        Serial.read();
+    }
+
+    Serial.println(command.c_str());
+
+    string response;
+    auto deadline = chrono::steady_clock::now() + timeout;
+
+    while (chrono::steady_clock::now() < deadline) {
+        if (Serial.available() > 0) {
+            const char received = Serial.read();
+            response.push_back(received);
+            printf("%c", received);
+
+            for (const auto& token : terminal_tokens) {
+                if (!token.empty() && response.find(token) != string::npos) {
+                    return response;
+                }
+            }
+        } else {
+            this_thread::sleep_for(chrono::milliseconds(20));
+        }
+    }
+
+    return response;
+}
+
 static bool response_contains(const string& response, const string& needle)
 {
     return response.find(needle) != string::npos;
+}
+
+static string format_debug_response(const string& response)
+{
+    ostringstream formatted;
+    for (unsigned char ch : response) {
+        if (ch == '\r') {
+            formatted << "\\r";
+        } else if (ch == '\n') {
+            formatted << "\\n";
+        } else if (isprint(ch)) {
+            formatted << static_cast<char>(ch);
+        } else {
+            formatted << "\\x"
+                      << hex << setw(2) << setfill('0') << static_cast<int>(ch)
+                      << dec << setfill(' ');
+        }
+    }
+    return formatted.str();
 }
 
 static vector<uint8_t> encode_remaining_length(size_t length)
@@ -347,24 +419,64 @@ static vector<uint8_t> build_publish_packet(const string& payload)
     return packet;
 }
 
-static bool sim7600_send_socket_payload(const vector<uint8_t>& payload, chrono::milliseconds timeout, string* response_out = nullptr)
+static bool sim7600_send_socket_chunk(const vector<uint8_t>& payload, chrono::milliseconds timeout, string* response_out = nullptr)
 {
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "AT+CIPSEND=0,%zu", payload.size());
-    const string prompt = send_at_collect(cmd, chrono::milliseconds(3000));
+    const string prompt = send_at_collect_until(
+        cmd,
+        chrono::milliseconds(8000),
+        {">", "ERROR", "+IPCLOSE", "CLOSE OK", "+CIPEVENT:"});
     if (!response_contains(prompt, ">")) {
-        fprintf(stderr, "CIPSEND prompt failed\n");
+        fprintf(stderr, "CIPSEND prompt failed: %s\n", format_debug_response(prompt).c_str());
         return false;
     }
 
     const string response = send_binary_collect(payload, timeout);
     if (!response_contains(response, "+CIPSEND: 0")) {
-        fprintf(stderr, "CIPSEND failed\n");
+        fprintf(stderr, "CIPSEND failed: %s\n", format_debug_response(response).c_str());
         return false;
     }
 
     if (response_out != nullptr) {
         *response_out = response;
+    }
+    return true;
+}
+
+static bool sim7600_send_socket_payload(const vector<uint8_t>& payload, chrono::milliseconds timeout, string* response_out = nullptr)
+{
+    if (payload.empty()) {
+        if (response_out != nullptr) {
+            response_out->clear();
+        }
+        return true;
+    }
+
+    if (payload.size() <= SIM7600_CIPSEND_CHUNK_SIZE) {
+        return sim7600_send_socket_chunk(payload, timeout, response_out);
+    }
+
+    printf("Sending %zu byte socket payload in %zu chunks\n",
+           payload.size(),
+           (payload.size() + SIM7600_CIPSEND_CHUNK_SIZE - 1) / SIM7600_CIPSEND_CHUNK_SIZE);
+
+    string combined_response;
+    for (size_t offset = 0; offset < payload.size(); offset += SIM7600_CIPSEND_CHUNK_SIZE) {
+        const size_t chunk_size = min(SIM7600_CIPSEND_CHUNK_SIZE, payload.size() - offset);
+        vector<uint8_t> chunk(payload.begin() + static_cast<ptrdiff_t>(offset),
+                              payload.begin() + static_cast<ptrdiff_t>(offset + chunk_size));
+
+        string chunk_response;
+        if (!sim7600_send_socket_chunk(chunk, timeout, &chunk_response)) {
+            return false;
+        }
+
+        combined_response += chunk_response;
+    }
+
+    if (response_out != nullptr) {
+        *response_out = combined_response;
     }
     return true;
 }
@@ -426,7 +538,18 @@ static bool sim7600_mqtt_connect()
 
 static bool publish_payload(const string& payload)
 {
-    return sim7600_send_socket_payload(build_publish_packet(payload), chrono::milliseconds(5000));
+    const vector<uint8_t> packet = build_publish_packet(payload);
+    if (sim7600_send_socket_payload(packet, chrono::milliseconds(5000))) {
+        return true;
+    }
+
+    fprintf(stderr, "Publish failed, reconnecting MQTT session\n");
+    if (!sim7600_mqtt_connect()) {
+        fprintf(stderr, "MQTT reconnect failed\n");
+        return false;
+    }
+
+    return sim7600_send_socket_payload(packet, chrono::milliseconds(5000));
 }
 
 static void sim7600_mqtt_disconnect()
@@ -467,7 +590,9 @@ static bool read_tail_lines(const string& file_path, size_t last_n_lines, string
 static void follow_csv_updates_and_publish(
     const string& file_path,
     chrono::milliseconds poll_interval,
-    const CsvColumns& cols)
+    const CsvColumns& cols,
+    size_t lines_to_tail,
+    deque<string> recent_lines)
 {
     ifstream input(file_path);
     if (!input.is_open()) {
@@ -480,60 +605,83 @@ static void follow_csv_updates_and_publish(
 
     input.seekg(0, ios::end);
     streamoff last_offset = static_cast<streamoff>(input.tellg());
-    if (last_offset < 0) {
-        last_offset = 0;
-    }
+    if (last_offset < 0) last_offset = 0;
 
     while (true) {
         this_thread::sleep_for(poll_interval);
 
         std::error_code ec;
-        const uintmax_t current_size = filesystem::file_size(file_path, ec);
-        if (ec) {
-            continue;
-        }
+        uintmax_t current_size = filesystem::file_size(file_path, ec);
+        if (ec) continue;
 
         if (static_cast<uintmax_t>(last_offset) > current_size) {
             input.clear();
             input.close();
             input.open(file_path);
-            if (!input.is_open()) {
+            if (!input.is_open()) continue;
+
+            string skip_header;
+            if (!getline(input, skip_header)) {
+                recent_lines.clear();
+                last_offset = 0;
                 continue;
             }
 
-            string skip_header;
-            getline(input, skip_header);
+            recent_lines.clear();
             last_offset = static_cast<streamoff>(input.tellg());
-            if (last_offset < 0) {
-                last_offset = 0;
-            }
+            if (last_offset < 0) last_offset = 0;
+
+            current_size = filesystem::file_size(file_path, ec);
+            if (ec || static_cast<uintmax_t>(last_offset) >= current_size) continue;
         }
 
-        if (static_cast<uintmax_t>(last_offset) == current_size) {
-            continue;
-        }
+        if (static_cast<uintmax_t>(last_offset) >= current_size) continue;
 
         input.clear();
         input.seekg(last_offset, ios::beg);
 
         string line;
-        while (getline(input, line)) {
-            if (trim_copy(line).empty()) {
-                continue;
+        bool got_new_data = false;
+
+        while (true) {
+            const streamoff line_start = static_cast<streamoff>(input.tellg());
+            if (!getline(input, line)) {
+                input.clear();
+                if (line_start >= 0) {
+                    input.seekg(line_start, ios::beg);
+                }
+                break;
             }
 
+            if (input.eof()) {
+                input.clear();
+                if (line_start >= 0) {
+                    input.seekg(line_start, ios::beg);
+                }
+                break;
+            }
+
+            const streamoff next_offset = static_cast<streamoff>(input.tellg());
+            if (next_offset >= 0) {
+                last_offset = next_offset;
+            }
+
+            if (trim_copy(line).empty()) continue;
+
             cout << line << '\n';
-            const vector<string> row = split_csv_line(line);
-            const string payload = build_payload_json(row, cols);
-            cout << "Publishing JSON: " << payload << '\n';
-            publish_payload(payload);
+
+            recent_lines.push_back(line);
+            if (recent_lines.size() > lines_to_tail) {
+                recent_lines.pop_front();
+            }
+
+            got_new_data = true;
         }
 
-        input.clear();
-        input.seekg(0, ios::end);
-        last_offset = static_cast<streamoff>(input.tellg());
-        if (last_offset < 0) {
-            last_offset = 0;
+        if (got_new_data) {
+            const string payload = build_batch_payload_json(recent_lines, cols);
+            cout << "Publishing JSON batch: " << payload << '\n';
+            publish_payload(payload);
         }
     }
 }
@@ -542,7 +690,7 @@ static void follow_csv_updates_and_publish(
 int main(void)
 {
     const string csv_path = "/data/eerl/latest.log";
-    const size_t lines_to_tail = 1;
+    const size_t lines_to_tail = 10;
     const chrono::milliseconds poll_interval(1000);
 
     string header_line;
@@ -560,18 +708,18 @@ int main(void)
     }
 
     cout << "Last " << tail_lines.size() << " line(s) from CSV:\n";
-    int rc = 0;
     for (const auto& row_line : tail_lines) {
         cout << row_line << '\n';
-        const vector<string> row = split_csv_line(row_line);
-        const string payload = build_payload_json(row, cols);
-        cout << "Publishing JSON: " << payload << '\n';
-        if (!publish_payload(payload)) {
-            rc = 3;
-        }
     }
 
-    follow_csv_updates_and_publish(csv_path, poll_interval, cols);
+    int rc = 0;
+    const string payload = build_batch_payload_json(tail_lines, cols);
+    cout << "Publishing JSON batch: " << payload << '\n';
+    if (!publish_payload(payload)) {
+        rc = 3;
+    }
+
+    follow_csv_updates_and_publish(csv_path, poll_interval, cols, lines_to_tail, tail_lines);
 
     sim7600_mqtt_disconnect();
     return rc;
