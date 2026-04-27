@@ -45,7 +45,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <poll.h>
-#include <bcm2835.h>
+#include "bcm2835/src/bcm2835.h"
 #include <stdarg.h> //Include forva_start, va_arg and va_end strings functions
 
 #define IOBASE   0x3f000000
@@ -242,10 +242,8 @@ static int REV = 0;
 #define SPI_CLOCK_DIV2 2       ///< 2 = 6.25ns = 160MHz
 #define SPI_CLOCK_DIV1 1       ///< 0 = 256us = 4kHz
 
-namespace unistd {
-	//All functions of unistd.h must be called like this: unistd::the_function()
-    #include <unistd.h>
-};
+
+#include <unistd.h>
 
 
 enum Representation{
