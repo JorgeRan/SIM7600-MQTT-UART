@@ -113,6 +113,8 @@ struct CsvColumns {
     int wind_x = 0;
     int wind_y = 0;
     int wind_z = 0;
+    int methane_valid = 0;
+    int flight_status = 0;
 };
 
 static int find_column_index(const vector<string>& headers, const vector<string>& candidates)
@@ -144,6 +146,8 @@ static CsvColumns resolve_columns(const vector<string>& headers)
     c.wind_x = find_column_index(headers, {"Wind U [m/s]"});
     c.wind_y = find_column_index(headers, {"Wind V [m/s]"});
     c.wind_z = find_column_index(headers, {"Wind W [m/s]"});
+    c.methane_valid = find_column_index(headers, {"Methane Valid"});
+    c.flight_status = find_column_index(headers, {"Flight Status"});
     return c;
 }
 
@@ -671,6 +675,8 @@ static string build_batch_payload(const deque<string>& lines, const CsvColumns& 
         batch << "," << json_number_or_null(get_value(row, cols.wind_x));
         batch << "," << json_number_or_null(get_value(row, cols.wind_y));
         batch << "," << json_number_or_null(get_value(row, cols.wind_z));
+        batch << "," << json_number_or_null(get_value(row, cols.methane_valid));
+        batch << "," << json_number_or_null(get_value(row, cols.flight_status));
         batch << "]";
         first = false;
     }
