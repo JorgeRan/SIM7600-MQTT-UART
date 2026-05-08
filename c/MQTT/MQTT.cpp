@@ -143,9 +143,9 @@ static CsvColumns resolve_columns(const vector<string>& headers)
     c.altitude = find_column_index(headers, {"RTK HFSL [m]"});
     c.targ_latitude = find_column_index(headers, {"Targ Lat [deg]"});
     c.targ_longitude = find_column_index(headers, {"Targ Lon [deg]"});
-    c.wind_x = find_column_index(headers, {"Wind U [m/s]"});
-    c.wind_y = find_column_index(headers, {"Wind V [m/s]"});
-    c.wind_z = find_column_index(headers, {"Wind W [m/s]"});
+    c.wind_x = find_column_index(headers, {"WindC X [m/s]"});
+    c.wind_y = find_column_index(headers, {"WindC Y [m/s]"});
+    c.wind_z = find_column_index(headers, {"WindC Z [m/s]"});
     c.methane_valid = find_column_index(headers, {"Methane Valid"});
     c.flight_status = find_column_index(headers, {"Flight Status"});
     return c;
